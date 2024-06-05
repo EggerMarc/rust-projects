@@ -1,5 +1,3 @@
-
-
 pub mod proto {
     tonic::include_proto!("routeguide");
 }
@@ -28,7 +26,6 @@ impl Hash for Point {
 impl Eq for Point {}
 
 fn in_range(point: &Point, rectangle: &Rectangle) -> bool {
-    
     let _lo = rectangle.lo.as_ref().unwrap();
     let _hi = rectangle.hi.as_ref().unwrap();
     
@@ -65,9 +62,9 @@ struct RouteGuideService {
 
 #[tonic::async_trait]
 impl RouteGuide for RouteGuideService {
-    async fn get_feature(&self, _request: Request<Point>) -> Result<Response<Feature>, Status> { 
+    async fn get_feature(&self, request: Request<Point>) -> Result<Response<Feature>, Status> { 
         for feature in &self.features[..] {
-            if feature.location.as_ref() == Some(_request.get_ref()) {
+            if feature.location.as_ref() == Some(request.get_ref()) {
                 return Ok(Response::new(feature.clone()));
             }
          }
@@ -79,10 +76,23 @@ impl RouteGuide for RouteGuideService {
 
     async fn list_features(
         &self,
-        _request: Request<Rectangle>,
+        request: Request<Rectangle>,
     ) -> Result<Response<Self::ListFeaturesStream>, Status> {
-        unimplemented!()
+        let (mut tx, rx) = mpsc::channel(4);
+        let features = self.features.clone();
+
+        tokio::spawn(async move {
+            for feature in &features[..] {
+                if in_range(feature.location.as_ref().unwrap(), request.get_ref()) {
+                    tx.send(Ok(feature.clone())).await.unwrap();
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
+
+
 
     async fn record_route(
         &self,
