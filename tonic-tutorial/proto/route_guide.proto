@@ -8,7 +8,7 @@ service RouteGuide {
     rpc GetFeature (Point) returns (Feature){}
     rpc ListFeatures (Rectangle) returns (stream Feature) {}
     rpc RecordRoute (stream Point) returns (RouteSummary) {}
-    rpc RouteChat (stream Point) returns (stream RouteNote) {}
+    rpc RouteChat (stream RouteNote) returns (stream RouteNote) {}
     }
 
 
@@ -27,7 +27,13 @@ message Feature {
 }
 
 message RouteSummary {
+    int32 point_count = 1;
+    int32 feature_count = 2;
+    int32 distance = 3; // in meters
+    int32 elapsed_time = 4; // in seconds
 }
 
 message RouteNote {
+    Point location = 1;
+    string message = 2;
     }

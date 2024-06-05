@@ -8,13 +8,17 @@ use proto::{Feature, Point, Rectangle, RouteNote, RouteSummary};
 use std::pin::Pin; //Pinned pointer
 use std::sync::Arc; // Atomically referenced counter ?
 use std::cmp; //utilities for comparing and ordering
+use std::time::Instant;
+
 use tokio::sync::mpsc; // Multi-producer, single consumer queue for sending values between
                        // async tasks
-use tokio_stream::{wrappers::ReceiverStream, Stream};
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
 
 use std::hash::{Hash, Hasher};
+use std::collections::HashMap;
+
 impl Hash for Point {
     fn hash<H>(&self, state: &mut H)
     where H: Hasher, {
@@ -78,9 +82,10 @@ impl RouteGuide for RouteGuideService {
         &self,
         request: Request<Rectangle>,
     ) -> Result<Response<Self::ListFeaturesStream>, Status> {
+        // Create a channel to return stream of values 
         let (mut tx, rx) = mpsc::channel(4);
         let features = self.features.clone();
-
+        
         tokio::spawn(async move {
             for feature in &features[..] {
                 if in_range(feature.location.as_ref().unwrap(), request.get_ref()) {
@@ -96,9 +101,34 @@ impl RouteGuide for RouteGuideService {
 
     async fn record_route(
         &self,
-        _request: Request<tonic::Streaming<Point>>,
+        request: Request<tonic::Streaming<Point>>,
     ) -> Result<Response<RouteSummary>, Status> {
-        unimplemented!()
+        let mut stream = request.into_inner();
+        let mut summary = RouteSummary::default();
+        let mut last_point = None;
+        let now = Instant::now();
+    
+        // loop over stream and "match" points
+        while let Some(point) = stream.next().await {
+            let point = point?;
+            summary.point_count += 1;
+            
+            // Usual point feature "getter"
+            for feature in &self.features[..] {
+                if feature.location.as_ref() == Some(&point) {
+                    summary.feature_count += 1;
+                }
+            }
+            
+            if let Some(ref last_point) = last_point {
+                summary.distance += calc_distance(last_point, &point);
+            }
+
+            last_point = Some(point);
+        }
+        
+        summary.elapsed_time = now.elapsed().as_secs() as i32;
+        Ok(Response::new(summary))
     }
 
     // HELP
@@ -106,9 +136,24 @@ impl RouteGuide for RouteGuideService {
 
     async fn route_chat(
         &self,
-        _request: Request<tonic::Streaming<Point>>,
+        request: Request<tonic::Streaming<RouteNote>>,
     ) -> Result<Response<Self::RouteChatStream>, Status> {
-        unimplemented!()
+    let mut notes = HashMap::new();
+    let mut stream = request.into_inner();
+
+    let output = async_stream::try_stream! {
+        while let Some(note) = stream.next().await {
+            let note = note?;
+            let location = note.location.clone().unwrap();
+            let location_notes = notes.entry(location).or_insert(vec![]);
+            location_notes.push(note);
+
+            for note in location_notes {
+                yield note.clone();
+            }
+        }
+    };
+    Ok(Response::new(Box::pin(output) as Self::RouteChatStream))
     }
 }
 
