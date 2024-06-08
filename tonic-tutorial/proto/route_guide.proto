@@ -23,7 +23,8 @@ message Rectangle {
 }
 
 message Feature {
-    Point location = 1;
+    string name = 1;
+    Point location = 2;
 }
 
 message RouteSummary {
