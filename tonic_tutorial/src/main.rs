@@ -7,11 +7,20 @@ use tonic_tutorial::{data, RouteGuideService};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:10000".parse()?;
 
-    let features = data::load()?;
-    println!("✅ Loaded {} features", features.len());
+    let features_vec = data::load()?;
+    println!("✅ Loaded {} features", features_vec.len());
+
+    let features: Arc<[tonic_tutorial::proto::Feature]> =
+        Arc::from(features_vec.into_boxed_slice());
+
+    let feature_map = features
+        .iter()
+        .filter_map(|f| f.location.map(|loc| (loc, f.clone())))
+        .collect();
 
     let route_guide = RouteGuideService {
-        features: Arc::new(features),
+        features,
+        feature_map,
     };
 
     println!("🚀 Starting gRPC server on http://{}", addr);

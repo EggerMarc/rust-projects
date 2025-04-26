@@ -22,7 +22,8 @@ impl Eq for Point {}
 
 #[derive(Debug)]
 pub struct RouteGuideService {
-    pub features: Arc<Vec<Feature>>,
+    pub features: Arc<[Feature]>, // Agora um slice Arc<[Feature]>
+    pub feature_map: HashMap<Point, Feature>, // HashMap para O(1) buscas
 }
 
 #[tonic::async_trait]

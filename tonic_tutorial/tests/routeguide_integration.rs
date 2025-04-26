@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -16,9 +17,18 @@ const SERVER_STARTUP_DELAY_MS: u64 = 100;
 /// Inicia o servidor gRPC na porta especificada
 async fn start_test_server(port: u16) {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let features = Arc::new(data::load().expect("Failed to load features"));
+
+    let features_vec = data::load().expect("Failed to load features");
+    let features: Arc<[Feature]> = Arc::from(features_vec.into_boxed_slice());
+
+    let feature_map: HashMap<Point, Feature> = features
+        .iter()
+        .filter_map(|f| f.location.map(|loc| (loc, f.clone())))
+        .collect();
+
     let route_guide = RouteGuideService {
-        features: Arc::clone(&features),
+        features,
+        feature_map,
     };
 
     tokio::spawn(async move {
