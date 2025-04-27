@@ -1,32 +1,34 @@
-use std::sync::Arc;
+use std::net::SocketAddr;
 use tonic::transport::Server;
-use tonic_tutorial::proto::route_guide_server::RouteGuideServer;
-use tonic_tutorial::{data, RouteGuideService};
+use tonic_tutorial::{
+    data, // helper that deserialises route_guide_db.json
+    proto::route_guide_server::RouteGuideServer,
+    RouteGuideService,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "[::1]:10000".parse()?;
+    // ------------------------------------------------------------------
+    // 1 · Load the features once at start-up
+    // ------------------------------------------------------------------
+    let features = data::load()?; // Vec<proto::Feature>
+    println!("✅ Loaded {} features", features.len());
 
-    let features_vec = data::load()?;
-    println!("✅ Loaded {} features", features_vec.len());
+    // ------------------------------------------------------------------
+    // 2 · Instantiate the service (builds maps + R-tree inside)
+    // ------------------------------------------------------------------
+    let route_guide = RouteGuideService::new(features);
 
-    let features: Arc<[tonic_tutorial::proto::Feature]> =
-        Arc::from(features_vec.into_boxed_slice());
-
-    let feature_map = features
-        .iter()
-        .filter_map(|f| f.location.map(|loc| (loc, f.clone())))
-        .collect();
-
-    let route_guide = RouteGuideService {
-        features,
-        feature_map,
-    };
-
+    // ------------------------------------------------------------------
+    // 3 · Launch the gRPC server
+    // ------------------------------------------------------------------
+    let addr: SocketAddr = "[::1]:10000".parse()?;
     println!("🚀 Starting gRPC server on http://{}", addr);
 
-    let svc = RouteGuideServer::new(route_guide);
-    Server::builder().add_service(svc).serve(addr).await?;
+    Server::builder()
+        .add_service(RouteGuideServer::new(route_guide))
+        .serve(addr)
+        .await?;
 
     Ok(())
 }

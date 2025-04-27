@@ -1,100 +1,88 @@
-use std::collections::HashMap;
+//! tests/route_guide.rs
+//! Integration tests for RouteGuideService
+
 use std::net::SocketAddr;
-use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
 use tonic::transport::Server;
-use tonic_tutorial::data;
-use tonic_tutorial::proto::route_guide_client::RouteGuideClient;
-use tonic_tutorial::proto::route_guide_server::RouteGuideServer;
-use tonic_tutorial::proto::{Feature, Point, Rectangle, RouteNote};
-use tonic_tutorial::service::RouteGuideService;
+use tonic_tutorial::{
+    data,
+    proto::{
+        route_guide_client::RouteGuideClient, route_guide_server::RouteGuideServer, Point,
+        Rectangle, RouteNote,
+    },
+    service::RouteGuideService,
+};
 
-// ==== Helpers ====
+// --------------------------------------------------------------------- helpers
 
 const SERVER_STARTUP_DELAY_MS: u64 = 100;
 
-/// Inicia o servidor gRPC na porta especificada
 async fn start_test_server(port: u16) {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
-    let features_vec = data::load().expect("Failed to load features");
-    let features: Arc<[Feature]> = Arc::from(features_vec.into_boxed_slice());
-
-    let feature_map: HashMap<Point, Feature> = features
-        .iter()
-        .filter_map(|f| f.location.map(|loc| (loc, f.clone())))
-        .collect();
-
-    let route_guide = RouteGuideService {
-        features,
-        feature_map,
-    };
+    // Load the data set and hand it straight to the constructor
+    let features = data::load().expect("failed to load features");
+    let route_guide = RouteGuideService::new(features);
 
     tokio::spawn(async move {
-        let svc = RouteGuideServer::new(route_guide);
         println!("🚀 Starting test server on {}", addr);
         Server::builder()
-            .add_service(svc)
+            .add_service(RouteGuideServer::new(route_guide))
             .serve(addr)
             .await
-            .expect("Server failed");
+            .expect("server crashed");
     });
 
+    // Give the async server a moment to bind the socket
     sleep(Duration::from_millis(SERVER_STARTUP_DELAY_MS)).await;
 }
 
-/// Cria um client gRPC para a porta especificada
 async fn setup_client(port: u16) -> RouteGuideClient<tonic::transport::Channel> {
-    RouteGuideClient::connect(format!("http://127.0.0.1:{}", port))
+    RouteGuideClient::connect(format!("http://127.0.0.1:{port}"))
         .await
         .expect("client connect failed")
 }
 
-// ==== Tests ====
+// --------------------------------------------------------------------- tests
 
 #[tokio::test]
-async fn test_get_feature_returns_expected_feature() {
-    const PORT: u16 = 50051;
+async fn get_feature_returns_expected_feature() {
+    const PORT: u16 = 50_051;
     start_test_server(PORT).await;
     let mut client = setup_client(PORT).await;
 
-    let request = tonic::Request::new(Point {
-        latitude: 409146138,
-        longitude: -746188906,
-    });
-
     let response = client
-        .get_feature(request)
+        .get_feature(tonic::Request::new(Point {
+            latitude: 409_146_138,
+            longitude: -746_188_906,
+        }))
         .await
         .expect("get_feature failed");
 
-    let feature: Feature = response.into_inner();
     assert_eq!(
-        feature.name,
+        response.into_inner().name,
         "Berkshire Valley Management Area Trail, Jefferson, NJ, USA"
     );
 }
 
 #[tokio::test]
-async fn test_list_features_returns_features_in_rectangle() {
-    const PORT: u16 = 50052;
+async fn list_features_returns_features_in_rectangle() {
+    const PORT: u16 = 50_052;
     start_test_server(PORT).await;
     let mut client = setup_client(PORT).await;
 
-    let rectangle = tonic::Request::new(Rectangle {
-        lo: Some(Point {
-            latitude: 400000000,
-            longitude: -750000000,
-        }),
-        hi: Some(Point {
-            latitude: 420000000,
-            longitude: -730000000,
-        }),
-    });
-
     let mut stream = client
-        .list_features(rectangle)
+        .list_features(tonic::Request::new(Rectangle {
+            lo: Some(Point {
+                latitude: 400_000_000,
+                longitude: -750_000_000,
+            }),
+            hi: Some(Point {
+                latitude: 420_000_000,
+                longitude: -730_000_000,
+            }),
+        }))
         .await
         .expect("list_features failed")
         .into_inner();
@@ -105,77 +93,71 @@ async fn test_list_features_returns_features_in_rectangle() {
         count += 1;
     }
 
-    assert!(count > 0, "Expected at least one feature in rectangle");
+    assert!(count > 0, "expected at least one feature in rectangle");
 }
 
 #[tokio::test]
-async fn test_record_route_returns_summary() {
-    const PORT: u16 = 50053;
+async fn record_route_returns_summary() {
+    const PORT: u16 = 50_053;
     start_test_server(PORT).await;
     let mut client = setup_client(PORT).await;
 
     let points = vec![
         Point {
-            latitude: 409146138,
-            longitude: -746188906,
+            latitude: 409_146_138,
+            longitude: -746_188_906,
         },
         Point {
-            latitude: 410248224,
-            longitude: -743099979,
+            latitude: 410_248_224,
+            longitude: -743_099_979,
         },
     ];
 
-    let stream = tokio_stream::iter(points);
-    let request = tonic::Request::new(stream);
-
-    let response = client
-        .record_route(request)
+    let summary = client
+        .record_route(tonic::Request::new(tokio_stream::iter(points)))
         .await
-        .expect("record_route failed");
+        .expect("record_route failed")
+        .into_inner();
 
-    let summary = response.into_inner();
     assert_eq!(summary.point_count, 2);
     assert!(summary.distance > 0);
     assert!(summary.elapsed_time >= 0);
 }
 
 #[tokio::test]
-async fn test_route_chat_exchanges_notes() {
-    const PORT: u16 = 50054;
+async fn route_chat_exchanges_notes() {
+    const PORT: u16 = 50_054;
     start_test_server(PORT).await;
     let mut client = setup_client(PORT).await;
 
     let notes = vec![
         RouteNote {
             location: Some(Point {
-                latitude: 409146138,
-                longitude: -746188906,
+                latitude: 409_146_138,
+                longitude: -746_188_906,
             }),
-            message: "First note".to_string(),
+            message: "First note".into(),
         },
         RouteNote {
             location: Some(Point {
-                latitude: 409146138,
-                longitude: -746188906,
+                latitude: 409_146_138,
+                longitude: -746_188_906,
             }),
-            message: "Second note".to_string(),
+            message: "Second note".into(),
         },
     ];
 
-    let stream = tokio_stream::iter(notes);
-    let request = tonic::Request::new(stream);
-
-    let mut response_stream = client
-        .route_chat(request)
+    let mut stream = client
+        .route_chat(tonic::Request::new(tokio_stream::iter(notes)))
         .await
         .expect("route_chat failed")
         .into_inner();
 
-    let mut received_messages = Vec::new();
-    while let Some(note) = response_stream.message().await.unwrap() {
-        received_messages.push(note.message);
+    let mut received = Vec::new();
+    while let Some(note) = stream.message().await.unwrap() {
+        received.push(note.message);
     }
 
-    assert!(received_messages.contains(&"First note".to_string()));
-    assert!(received_messages.contains(&"Second note".to_string()));
+    assert!(received.contains(&"First note".to_string()));
+    assert!(received.contains(&"Second note".to_string()));
 }

@@ -1,16 +1,39 @@
 use crate::proto::route_guide_server::RouteGuide;
 use crate::proto::{Feature, Point, Rectangle, RouteNote, RouteSummary};
-use std::cmp;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::mpsc;
-use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+
+use dashmap::DashMap;
+use once_cell::sync::OnceCell;
+use rstar::{RTree, RTreeObject, AABB};
+use std::{pin::Pin, sync::Arc, time::Instant};
+use tokio_stream::{iter, Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
-// Implementar Hash para Point
+use std::hash::{Hash, Hasher};
+
+/// ---- Geometry helpers ----------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct GeoPoint {
+    pb: Point, // lat / lon stored in 1 e-7 °
+    lat_rad: f64,
+    lon_rad: f64,
+}
+
+impl From<Point> for GeoPoint {
+    fn from(pb: Point) -> Self {
+        let scale = 1e7_f64;
+        Self {
+            lat_rad: (pb.latitude as f64 / scale).to_radians(),
+            lon_rad: (pb.longitude as f64 / scale).to_radians(),
+            pb,
+        }
+    }
+}
+
+/// Pre-initialised, immutable table that every R-tree leaf points into.
+static GEO_POINTS: OnceCell<Vec<GeoPoint>> = OnceCell::new();
+
+// ---- make prost::Point hash-able and Eq so we can use it as a DashMap key ----
 impl Hash for Point {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.latitude.hash(state);
@@ -18,47 +41,94 @@ impl Hash for Point {
     }
 }
 
-impl Eq for Point {}
+impl Eq for Point {} // PartialEq is already derived by prost
+
+/// Leaf = just an index into `GEO_POINTS`.
+#[derive(Debug, Clone, Copy)]
+struct FeatureIdx(usize);
+
+impl RTreeObject for FeatureIdx {
+    type Envelope = AABB<[i32; 2]>;
+
+    fn envelope(&self) -> Self::Envelope {
+        let p = &GEO_POINTS.get().expect("geo table")[self.0];
+        AABB::from_corners(
+            [p.pb.longitude, p.pb.latitude],
+            [p.pb.longitude, p.pb.latitude],
+        )
+    }
+}
+
+/// ---- gRPC service --------------------------------------------------------
 
 #[derive(Debug)]
 pub struct RouteGuideService {
-    pub features: Arc<[Feature]>, // Agora um slice Arc<[Feature]>
-    pub feature_map: HashMap<Point, Feature>, // HashMap para O(1) buscas
+    features: Arc<[Feature]>,
+    feature_map: DashMap<Point, Arc<Feature>>,
+    rtree: RTree<FeatureIdx>,
+}
+
+impl RouteGuideService {
+    pub fn new(features: Vec<Feature>) -> Self {
+        // 1. Move the Vec into an Arc slice
+        let features = Arc::<[Feature]>::from(features);
+
+        // 2. Build look-up structures
+        let feature_map = DashMap::with_capacity(features.len());
+        let mut geo_points = Vec::with_capacity(features.len());
+        let mut indices = Vec::with_capacity(features.len());
+
+        for (idx, feat) in features.iter().enumerate() {
+            if let Some(loc) = &feat.location {
+                // store an Arc for O(1) exact look-ups
+                feature_map.insert(loc.clone(), Arc::new(feat.clone()));
+
+                // prepare spatial index
+                geo_points.push(GeoPoint::from(loc.clone()));
+                indices.push(FeatureIdx(idx));
+            }
+        }
+
+        // 3. Publish the coordinate table exactly once
+        let _ = GEO_POINTS.set(geo_points);
+
+        Self {
+            features,
+            feature_map,
+            rtree: RTree::bulk_load(indices),
+        }
+    }
 }
 
 #[tonic::async_trait]
 impl RouteGuide for RouteGuideService {
     async fn get_feature(&self, request: Request<Point>) -> Result<Response<Feature>, Status> {
-        for feature in &self.features[..] {
-            if feature.location.as_ref() == Some(request.get_ref()) {
-                return Ok(Response::new(feature.clone()));
-            }
+        match self.feature_map.get(request.get_ref()) {
+            Some(f) => Ok(Response::new((**f).clone())),
+            None => Ok(Response::new(Feature::default())),
         }
-        Ok(Response::new(Feature::default()))
     }
 
-    type ListFeaturesStream = ReceiverStream<Result<Feature, Status>>;
+    type ListFeaturesStream = Pin<Box<dyn Stream<Item = Result<Feature, Status>> + Send + 'static>>;
 
     async fn list_features(
         &self,
         request: Request<Rectangle>,
     ) -> Result<Response<Self::ListFeaturesStream>, Status> {
-        let (tx, rx) = mpsc::channel(4);
-        let features = self.features.clone();
+        let rect = request.into_inner();
+        let lo = rect.lo.as_ref().unwrap();
+        let hi = rect.hi.as_ref().unwrap();
+        let query = AABB::from_corners([lo.longitude, lo.latitude], [hi.longitude, hi.latitude]);
 
-        tokio::spawn(async move {
-            for feature in &features[..] {
-                if let Some(location) = &feature.location {
-                    if in_range(location, request.get_ref())
-                        && tx.send(Ok(feature.clone())).await.is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        });
+        // Collect matching features into an owned Vec so the stream owns its data
+        let hits: Vec<Feature> = self
+            .rtree
+            .locate_in_envelope(&query)
+            .map(|idx| self.features[idx.0].clone())
+            .collect();
 
-        Ok(Response::new(ReceiverStream::new(rx)))
+        let output = iter(hits.into_iter().map(Ok));
+        Ok(Response::new(Box::pin(output)))
     }
 
     async fn record_route(
@@ -67,27 +137,24 @@ impl RouteGuide for RouteGuideService {
     ) -> Result<Response<RouteSummary>, Status> {
         let mut stream = request.into_inner();
         let mut summary = RouteSummary::default();
-        let mut last_point = None;
-        let now = Instant::now();
+        let mut last_point: Option<GeoPoint> = None;
+        let start = Instant::now();
 
         while let Some(point) = stream.next().await {
             let point = point?;
+            let geo = GeoPoint::from(point);
             summary.point_count += 1;
 
-            for feature in &self.features[..] {
-                if feature.location.as_ref() == Some(&point) {
-                    summary.feature_count += 1;
-                }
+            if self.feature_map.contains_key(&point) {
+                summary.feature_count += 1;
             }
-
-            if let Some(ref last_point) = last_point {
-                summary.distance += calc_distance(last_point, &point);
+            if let Some(prev) = &last_point {
+                summary.distance += fast_haversine(prev, &geo);
             }
-
-            last_point = Some(point);
+            last_point = Some(geo);
         }
 
-        summary.elapsed_time = now.elapsed().as_secs() as i32;
+        summary.elapsed_time = start.elapsed().as_secs() as i32;
         Ok(Response::new(summary))
     }
 
@@ -97,18 +164,17 @@ impl RouteGuide for RouteGuideService {
         &self,
         request: Request<tonic::Streaming<RouteNote>>,
     ) -> Result<Response<Self::RouteChatStream>, Status> {
-        let mut notes = HashMap::new();
+        let notes: DashMap<Point, Vec<RouteNote>> = DashMap::new();
         let mut stream = request.into_inner();
 
         let output = async_stream::try_stream! {
             while let Some(note) = stream.next().await {
                 let note = note?;
-                let location = note.location.unwrap();
-                let location_notes = notes.entry(location).or_insert(vec![]);
-                location_notes.push(note);
-
-                for note in location_notes {
-                    yield note.clone();
+                let loc  = note.location.unwrap();
+                let mut entry = notes.entry(loc).or_default();
+                entry.push(note.clone());
+                for n in entry.iter() {
+                    yield n.clone();
                 }
             }
         };
@@ -117,35 +183,15 @@ impl RouteGuide for RouteGuideService {
     }
 }
 
-// Funções auxiliares
-fn in_range(point: &Point, rectangle: &Rectangle) -> bool {
-    let lo = rectangle.lo.as_ref().unwrap();
-    let hi = rectangle.hi.as_ref().unwrap();
+/// ---- Fast haversine (caller already has radians) -------------------------
+#[inline]
+fn fast_haversine(a: &GeoPoint, b: &GeoPoint) -> i32 {
+    const R: f64 = 6_371_000.0;
+    let d_lat = b.lat_rad - a.lat_rad;
+    let d_lon = b.lon_rad - a.lon_rad;
 
-    let top = cmp::max(lo.latitude, hi.latitude);
-    let down = cmp::min(lo.latitude, hi.latitude);
-    let left = cmp::min(lo.longitude, hi.longitude);
-    let right = cmp::max(lo.longitude, hi.longitude);
+    let h = (d_lat * 0.5).sin().powi(2)
+        + a.lat_rad.cos() * b.lat_rad.cos() * (d_lon * 0.5).sin().powi(2);
 
-    point.longitude >= left
-        && point.longitude <= right
-        && point.latitude >= down
-        && point.latitude <= top
-}
-
-fn calc_distance(p1: &Point, p2: &Point) -> i32 {
-    let cord_factor: f64 = 1e7;
-    let r: f64 = 6_371_000.0;
-
-    let delta_lo = ((p1.longitude - p2.longitude) as f64 / cord_factor).to_radians();
-    let delta_la = ((p1.latitude - p2.latitude) as f64 / cord_factor).to_radians();
-    let lat_ra1 = (p1.latitude as f64 / cord_factor).to_radians();
-    let lat_ra2 = (p2.latitude as f64 / cord_factor).to_radians();
-
-    let a = (delta_la / 2f64).sin().powi(2)
-        + (lat_ra1).cos() * (lat_ra2).cos() * (delta_lo / 2f64).sin().powi(2);
-
-    let c = 2f64 * a.sqrt().atan2((1f64 - a).sqrt());
-
-    (r * c) as i32
+    (2.0 * R * h.sqrt().atan2((1.0 - h).sqrt())) as i32
 }
