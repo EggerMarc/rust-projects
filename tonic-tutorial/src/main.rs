@@ -165,13 +165,17 @@ impl RouteGuide for RouteGuideService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "[::1]10000".parse().unwrap();
+    let addr = "[::1]:10000".parse().unwrap(); // Corrigi também aqui! Estava faltando o ":"
+    
     let route_guide = RouteGuideService {
-        features: Arc::new(data::load()),
+        features: Arc::new(data::load()?), // <- agora usando ?
     };
 
     let svc = RouteGuideServer::new(route_guide);
-    Server::builder().add_service(svc).serve(addr).await?;
+    Server::builder()
+        .add_service(svc)
+        .serve(addr)
+        .await?;
 
     Ok(())
 }
