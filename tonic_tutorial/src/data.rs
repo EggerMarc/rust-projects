@@ -17,10 +17,10 @@ struct Location {
 
 #[allow(dead_code)]
 pub fn load() -> Result<Vec<crate::proto::Feature>, Box<dyn Error>> {
-    let data_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/route_guide_data.json");
+    let data_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/route_guide_db.json");
     let file = File::open(&data_path)?;
 
-    let features: Vec<Feature> = serde_json::from_reader(file)?; // Leitura direta
+    let features: Vec<Feature> = serde_json::from_reader(file)?;
 
     Ok(features
         .into_iter()
@@ -33,4 +33,3 @@ pub fn load() -> Result<Vec<crate::proto::Feature>, Box<dyn Error>> {
         })
         .collect())
 }
-
